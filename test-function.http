@@ -8,16 +8,17 @@
 ### Replace with a real document_id returned in your Azure Functions Core
 ### Tools terminal logs after uploading a PDF (see blob_trigger / orchestrator
 ### log lines: "Started orchestration instance_id=... for document_id=...")
-@documentId = 80b7a218-2c0d-41d4-b9a4-2dc9fa126610
+@azureDocumentId = 80b7a218-2c0d-41d4-b9a4-2dc9fa126610
+@localDocumentId = ##########
 
 ### 1. Get results - LOCAL (Azurite)
-GET {{localBaseUrl}}/results/{{documentId}}
+GET {{localBaseUrl}}/results/{{localDocumentId}}
 Accept: application/json
 
 ### 2. Get results - AZURE (deployed)
-GET {{azureBaseUrl}}/results/{{documentId}}
+GET {{azureBaseUrl}}/results/{{azureDocumentId}}
 Accept: application/json
 
 ### 3. Get results for a document_id that does not exist (should return 404)
-GET {{localBaseUrl}}/results/00000000-0000-0000-0000-000000000000
+GET {{azureBaseUrl}}/results/00000000-0000-0000-0000-000000000000
 Accept: application/json
