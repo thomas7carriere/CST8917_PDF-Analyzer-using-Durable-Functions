@@ -14,6 +14,8 @@
 - Thomas de Haan Carriere: created and tested the 4 functions for analyzing the pdf documents.
 - Ilyas Zazai:
 
+## Setup Instructions
+
 ## AI Disclosure
 - Vijayxavier Walter:
 - Thomas de Haan Carriere: AI was used to help generate the 4 pdf analysis functions. All code was carefully reviewed for correctness and understanding.
