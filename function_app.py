@@ -22,24 +22,23 @@ Architecture (Fan-Out/Fan-In + Chaining):
           v
     [HTTP Endpoint] -- GET /api/results/{document_id} --> returns JSON report
 
-Function ownership in this file (3-person team):
-  - Person A (this file's author): blob_trigger, orchestrator, fan-out/fan-in
-    wiring, logging
-  - Person B: extract_text, extract_metadata  (TODO markers below)
-  - Person C: analyze_statistics, detect_sensitive_data, combine_report,
-    store_results (TODO markers below)
-  - HTTP endpoint (get_results) is shared/owned by whoever finishes first;
-    stub included so the pipeline is testable end-to-end today.
+Function ownership:
+  - Member 1: blob_trigger, orchestrator, combine_report, store_results, get_results
+  - Member 2: extract_text, extract_metadata, analyze_statistics, detect_sensitive_data
 """
 
-import logging
+import io
 import json
-import uuid
+import logging
 import os
+import re
+import uuid
 from datetime import datetime, timezone
 
 import azure.functions as func
 import azure.durable_functions as df
+import pypdf
+from azure.storage.blob import BlobServiceClient
 
 app = df.DFApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -50,10 +49,6 @@ TABLE_NAME = os.environ.get("TABLE_NAME", "PdfAnalysisResults")
 # ---------------------------------------------------------------------------
 # 1) BLOB TRIGGER
 # ---------------------------------------------------------------------------
-# Fires automatically whenever a new PDF is uploaded to the "pdfs" container.
-# Its only job is to start a new orchestration instance and pass along the
-# blob's name and path. Keep this function thin -- all real work happens in
-# the orchestrator and activities.
 @app.blob_trigger(
     arg_name="myblob",
     path=f"{BLOB_CONTAINER_NAME}/{{name}}",
@@ -66,18 +61,13 @@ async def blob_trigger(myblob: func.InputStream, client):
         f"size={myblob.length} bytes"
     )
 
-    # Guard: only process PDFs (defensive check in case the container
-    # receives a non-PDF file).
     if not myblob.name.lower().endswith(".pdf"):
         logging.warning(
             f"[blob_trigger] Skipping non-PDF blob: {myblob.name}"
         )
         return
 
-    # Build the input payload passed into the orchestrator.
-    # blob_path is the path the activities will use to re-fetch the blob
-    # via the blob SDK (container + blob name).
-    blob_name_only = myblob.name.split("/", 1)[-1]  # strip container prefix
+    blob_name_only = myblob.name.split("/", 1)[-1]
     document_id = str(uuid.uuid4())
 
     orchestration_input = {
@@ -107,9 +97,6 @@ def orchestrator(context: df.DurableOrchestrationContext):
     blob_name = input_data["blob_name"]
     container = input_data["container"]
 
-    # context.create_replay_safe_logger avoids duplicate log lines during
-    # Durable Functions replay -- use this instead of plain `logging`
-    # inside the orchestrator body.
     logger = logging.getLogger(__name__)
 
     logger.info(
@@ -124,8 +111,6 @@ def orchestrator(context: df.DurableOrchestrationContext):
     }
 
     # ---- FAN-OUT ----
-    # Kick off all 4 analysis activities in parallel. None of these calls
-    # block here -- they just schedule the tasks.
     logger.info(f"[orchestrator] Fanning out 4 parallel activities for {blob_name}")
 
     parallel_tasks = [
@@ -136,9 +121,6 @@ def orchestrator(context: df.DurableOrchestrationContext):
     ]
 
     # ---- FAN-IN ----
-    # task_all suspends the orchestrator until ALL 4 activities complete.
-    # Durable Functions handles this efficiently (no compute billed while
-    # waiting), and replays deterministically on resume.
     results = yield context.task_all(parallel_tasks)
 
     text_result, metadata_result, stats_result, sensitive_result = results
@@ -149,7 +131,6 @@ def orchestrator(context: df.DurableOrchestrationContext):
     )
 
     # ---- CHAINING ----
-    # Step 1: combine all 4 results into one unified report.
     combine_input = {
         "document_id": document_id,
         "blob_name": blob_name,
@@ -162,7 +143,6 @@ def orchestrator(context: df.DurableOrchestrationContext):
     report = yield context.call_activity("combine_report", combine_input)
     logger.info(f"[orchestrator] Report combined for document_id={document_id}")
 
-    # Step 2: persist the combined report to Table Storage.
     store_result = yield context.call_activity("store_results", report)
     logger.info(
         f"[orchestrator] Results stored for document_id={document_id}: "
@@ -173,125 +153,286 @@ def orchestrator(context: df.DurableOrchestrationContext):
 
 
 # ---------------------------------------------------------------------------
-# 3-6) FOUR PARALLEL ACTIVITIES (fan-out targets)
+# MEMBER 2: PDF Analysis Engine
 # ---------------------------------------------------------------------------
-# NOTE TO TEAM: These are STUBS so the orchestrator + blob trigger can be
-# tested end-to-end right now. Replace the body of each function with real
-# logic, but KEEP the function name, the @app.activity_trigger decorator,
-# and the input/return shape the same so the orchestrator above doesn't
-# need to change.
-#
-# Each activity receives `activity_input` containing:
-#   { "document_id": str, "blob_name": str, "container": str }
-#
-# Use the blob SDK to fetch the actual PDF bytes, e.g.:
-#
-#   from azure.storage.blob import BlobServiceClient
-#   conn_str = os.environ["AzureWebJobsStorage"]
-#   blob_service = BlobServiceClient.from_connection_string(conn_str)
-#   blob_client = blob_service.get_blob_client(
-#       container=activity_input["container"], blob=activity_input["blob_name"]
-#   )
-#   pdf_bytes = blob_client.download_blob().readall()
-#
-# Then parse with pypdf / PyPDF2:
-#
-#   from pypdf import PdfReader
-#   import io
-#   reader = PdfReader(io.BytesIO(pdf_bytes))
+# Shared helper -- downloads the blob and returns a PdfReader.
+# All four activity functions below call this instead of duplicating
+# the blob client setup.
+
+def _read_pdf(blob_name: str, container: str) -> pypdf.PdfReader:
+    """Download a PDF blob from Azure Storage and return a PdfReader."""
+    blob_service = BlobServiceClient.from_connection_string(
+        os.environ["AzureWebJobsStorage"]
+    )
+    blob_client = blob_service.get_blob_client(
+        container=container, blob=blob_name
+    )
+    pdf_bytes = blob_client.download_blob().readall()
+    return pypdf.PdfReader(io.BytesIO(pdf_bytes))
 
 
+# ---------------------------------------------------------------------------
+# 3) extract_text
+# ---------------------------------------------------------------------------
 @app.activity_trigger(input_name="activity_input")
 def extract_text(activity_input: dict) -> dict:
-    """TODO (Person B): Extract text content from all pages of the PDF."""
-    logging.info(
-        f"[extract_text] STARTED for {activity_input['blob_name']}"
-    )
+    """
+    Extract readable text from every page of the uploaded PDF.
 
-    # --- TODO: replace stub below with real pypdf extraction ---
-    extracted_text = (
-        f"[STUB] Extracted text would appear here for "
-        f"{activity_input['blob_name']}"
-    )
-    page_texts = ["[STUB] page 1 text", "[STUB] page 2 text"]
-    # --- end stub ---
+    Returns:
+        {
+            "full_text":  str,         # all pages joined
+            "page_texts": [str],       # one entry per page
+            "page_count": int
+        }
+    """
+    blob_name = activity_input["blob_name"]
+    container = activity_input["container"]
 
-    logging.info(
-        f"[extract_text] FINISHED for {activity_input['blob_name']}"
-    )
-    return {
-        "full_text": extracted_text,
-        "page_texts": page_texts,
-    }
+    logging.info("[extract_text] Starting for: %s", blob_name)
+
+    try:
+        reader     = _read_pdf(blob_name, container)
+        page_texts = []
+        parts      = []
+
+        for i, page in enumerate(reader.pages):
+            try:
+                text = page.extract_text() or ""
+            except Exception as e:
+                logging.warning("[extract_text] Page %d error: %s", i + 1, e)
+                text = ""
+            page_texts.append(text.strip())
+            parts.append(text)
+
+        full_text = "\n".join(parts).strip()
+
+        logging.info("[extract_text] Done – %d pages for %s", len(page_texts), blob_name)
+        return {
+            "full_text":  full_text,
+            "page_texts": page_texts,
+            "page_count": len(page_texts),
+        }
+
+    except Exception as e:
+        logging.error("[extract_text] Failed for %s: %s", blob_name, e)
+        return {"full_text": "", "page_texts": [], "page_count": 0, "error": str(e)}
 
 
+# ---------------------------------------------------------------------------
+# 4) extract_metadata
+# ---------------------------------------------------------------------------
 @app.activity_trigger(input_name="activity_input")
 def extract_metadata(activity_input: dict) -> dict:
-    """TODO (Person B): Extract PDF metadata (author, title, created date, etc.)."""
-    logging.info(
-        f"[extract_metadata] STARTED for {activity_input['blob_name']}"
-    )
+    """
+    Extract PDF document metadata: title, author, creator, producer,
+    subject, creation date, and modification date.
 
-    # --- TODO: replace stub below with reader.metadata from pypdf ---
-    metadata = {
-        "title": "[STUB] Untitled",
-        "author": "[STUB] Unknown",
-        "creation_date": None,
-        "producer": "[STUB] Unknown",
-    }
-    # --- end stub ---
+    Returns:
+        {
+            "title":             str | None,
+            "author":            str | None,
+            "creator":           str | None,
+            "producer":          str | None,
+            "subject":           str | None,
+            "creation_date":     str | None,
+            "modification_date": str | None
+        }
+    """
+    blob_name = activity_input["blob_name"]
+    container = activity_input["container"]
 
-    logging.info(
-        f"[extract_metadata] FINISHED for {activity_input['blob_name']}"
-    )
-    return metadata
+    logging.info("[extract_metadata] Starting for: %s", blob_name)
+
+    def _clean(value) -> str | None:
+        if value is None:
+            return None
+        s = str(value).strip()
+        return s if s else None
+
+    try:
+        reader = _read_pdf(blob_name, container)
+        meta   = reader.metadata or {}
+
+        result = {
+            "title":             _clean(meta.get("/Title")),
+            "author":            _clean(meta.get("/Author")),
+            "creator":           _clean(meta.get("/Creator")),
+            "producer":          _clean(meta.get("/Producer")),
+            "subject":           _clean(meta.get("/Subject")),
+            "creation_date":     _clean(meta.get("/CreationDate")),
+            "modification_date": _clean(meta.get("/ModDate")),
+        }
+
+        logging.info(
+            "[extract_metadata] Done – title=%s, author=%s for %s",
+            result["title"], result["author"], blob_name
+        )
+        return result
+
+    except Exception as e:
+        logging.error("[extract_metadata] Failed for %s: %s", blob_name, e)
+        return {
+            "title": None, "author": None, "creator": None,
+            "producer": None, "subject": None,
+            "creation_date": None, "modification_date": None,
+            "error": str(e),
+        }
 
 
+# ---------------------------------------------------------------------------
+# 5) analyze_statistics
+# ---------------------------------------------------------------------------
 @app.activity_trigger(input_name="activity_input")
 def analyze_statistics(activity_input: dict) -> dict:
-    """TODO (Person C): Page count, word count, avg words/page, est. reading time."""
-    logging.info(
-        f"[analyze_statistics] STARTED for {activity_input['blob_name']}"
-    )
+    """
+    Calculate page count, word count, average words per page,
+    and estimated reading time (at 238 words per minute).
 
-    # --- TODO: compute real stats from extracted page text ---
-    page_count = 2
-    word_count = 0
-    avg_words_per_page = 0
-    estimated_reading_time_minutes = round(word_count / 200, 2)  # ~200 wpm
-    # --- end stub ---
+    Returns:
+        {
+            "page_count":                    int,
+            "word_count":                    int,
+            "avg_words_per_page":            float,
+            "estimated_reading_time_minutes": float
+        }
+    """
+    WORDS_PER_MINUTE = 238
 
-    logging.info(
-        f"[analyze_statistics] FINISHED for {activity_input['blob_name']}"
-    )
-    return {
-        "page_count": page_count,
-        "word_count": word_count,
-        "avg_words_per_page": avg_words_per_page,
-        "estimated_reading_time_minutes": estimated_reading_time_minutes,
-    }
+    blob_name = activity_input["blob_name"]
+    container = activity_input["container"]
+
+    logging.info("[analyze_statistics] Starting for: %s", blob_name)
+
+    try:
+        reader     = _read_pdf(blob_name, container)
+        page_count = len(reader.pages)
+        parts      = []
+
+        for i, page in enumerate(reader.pages):
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception as e:
+                logging.warning("[analyze_statistics] Page %d error: %s", i + 1, e)
+
+        words      = [w for w in " ".join(parts).split() if w.strip()]
+        word_count = len(words)
+
+        result = {
+            "page_count":                     page_count,
+            "word_count":                     word_count,
+            "avg_words_per_page":             round(word_count / page_count, 2) if page_count else 0.0,
+            "estimated_reading_time_minutes": round(word_count / WORDS_PER_MINUTE, 2),
+        }
+
+        logging.info(
+            "[analyze_statistics] Done – %d pages, %d words for %s",
+            page_count, word_count, blob_name
+        )
+        return result
+
+    except Exception as e:
+        logging.error("[analyze_statistics] Failed for %s: %s", blob_name, e)
+        return {
+            "page_count": 0, "word_count": 0,
+            "avg_words_per_page": 0.0,
+            "estimated_reading_time_minutes": 0.0,
+            "error": str(e),
+        }
 
 
+# ---------------------------------------------------------------------------
+# 6) detect_sensitive_data
+# ---------------------------------------------------------------------------
 @app.activity_trigger(input_name="activity_input")
 def detect_sensitive_data(activity_input: dict) -> dict:
-    """TODO (Person C): Regex-scan for emails, phone numbers, URLs, dates."""
-    logging.info(
-        f"[detect_sensitive_data] STARTED for {activity_input['blob_name']}"
+    """
+    Scan PDF text for sensitive patterns: emails, phone numbers,
+    URLs, and dates. All matches are deduplicated.
+
+    Returns:
+        {
+            "emails":        [str],
+            "phone_numbers": [str],
+            "urls":          [str],
+            "dates":         [str],
+            "summary": {
+                "email_count": int, "phone_count": int,
+                "url_count":   int, "date_count":  int,
+                "total_findings": int
+            }
+        }
+    """
+    EMAIL_PATTERN = r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'
+    PHONE_PATTERN = r'(?<!\d)(?:\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}(?!\d)'
+    URL_PATTERN   = r'\bhttps?://[^\s<>"\')\]]+(?<![.,;:!?])|www\.[^\s<>"\')\]]+(?<![.,;:!?])'
+    DATE_PATTERN  = (
+        r'\b(?:'
+        r'\d{4}[-/]\d{2}[-/]\d{2}'
+        r'|\d{2}[-/]\d{2}[-/]\d{4}'
+        r'|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?'
+        r'|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?'
+        r'|Dec(?:ember)?)\.?\s+\d{1,2},?\s+\d{4}'
+        r'|\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May'
+        r'|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?'
+        r'|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{4}'
+        r')\b'
     )
 
-    # --- TODO: run regex patterns against extracted text ---
-    findings = {
-        "emails": [],
-        "phone_numbers": [],
-        "urls": [],
-        "dates": [],
-    }
-    # --- end stub ---
+    blob_name = activity_input["blob_name"]
+    container = activity_input["container"]
 
-    logging.info(
-        f"[detect_sensitive_data] FINISHED for {activity_input['blob_name']}"
-    )
-    return findings
+    logging.info("[detect_sensitive_data] Starting for: %s", blob_name)
+
+    try:
+        reader = _read_pdf(blob_name, container)
+        parts  = []
+
+        for i, page in enumerate(reader.pages):
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception as e:
+                logging.warning("[detect_sensitive_data] Page %d error: %s", i + 1, e)
+
+        full_text = "\n".join(parts)
+
+        emails        = list(dict.fromkeys(re.findall(EMAIL_PATTERN, full_text, re.IGNORECASE)))
+        phone_numbers = list(dict.fromkeys(re.findall(PHONE_PATTERN, full_text)))
+        urls          = list(dict.fromkeys(re.findall(URL_PATTERN,   full_text)))
+        dates         = list(dict.fromkeys(re.findall(DATE_PATTERN,  full_text, re.IGNORECASE)))
+
+        summary = {
+            "email_count":    len(emails),
+            "phone_count":    len(phone_numbers),
+            "url_count":      len(urls),
+            "date_count":     len(dates),
+            "total_findings": len(emails) + len(phone_numbers) + len(urls) + len(dates),
+        }
+
+        logging.info(
+            "[detect_sensitive_data] Done – %d emails, %d phones, %d URLs, %d dates for %s",
+            summary["email_count"], summary["phone_count"],
+            summary["url_count"], summary["date_count"], blob_name,
+        )
+
+        return {
+            "emails":        emails,
+            "phone_numbers": phone_numbers,
+            "urls":          urls,
+            "dates":         dates,
+            "summary":       summary,
+        }
+
+    except Exception as e:
+        logging.error("[detect_sensitive_data] Failed for %s: %s", blob_name, e)
+        return {
+            "emails": [], "phone_numbers": [], "urls": [], "dates": [],
+            "summary": {
+                "email_count": 0, "phone_count": 0,
+                "url_count": 0, "date_count": 0, "total_findings": 0,
+            },
+            "error": str(e),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -299,25 +440,21 @@ def detect_sensitive_data(activity_input: dict) -> dict:
 # ---------------------------------------------------------------------------
 @app.activity_trigger(input_name="combine_input")
 def combine_report(combine_input: dict) -> dict:
-    """TODO (Person C): Merge all 4 activity results into one unified report.
-
-    Stub below already does a reasonable merge -- team can extend with
-    extra derived fields (e.g. a risk flag if sensitive data was found).
-    """
+    """Merge all 4 activity results into one unified report."""
     logging.info(
         f"[combine_report] Building unified report for "
         f"document_id={combine_input['document_id']}"
     )
 
     report = {
-        "document_id": combine_input["document_id"],
-        "blob_name": combine_input["blob_name"],
-        "uploaded_at": combine_input["uploaded_at"],
+        "document_id":  combine_input["document_id"],
+        "blob_name":    combine_input["blob_name"],
+        "uploaded_at":  combine_input["uploaded_at"],
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "text_extraction": combine_input["extract_text"],
-        "metadata": combine_input["extract_metadata"],
-        "statistics": combine_input["analyze_statistics"],
-        "sensitive_data": combine_input["detect_sensitive_data"],
+        "metadata":        combine_input["extract_metadata"],
+        "statistics":      combine_input["analyze_statistics"],
+        "sensitive_data":  combine_input["detect_sensitive_data"],
     }
 
     logging.info(
@@ -331,11 +468,7 @@ def combine_report(combine_input: dict) -> dict:
 # ---------------------------------------------------------------------------
 @app.activity_trigger(input_name="report")
 def store_results(report: dict) -> dict:
-    """TODO (Person C): Persist the combined report to Azure Table Storage.
-
-    Stub below shows the real Table Storage write pattern -- fill in the
-    connection string env var name to match whatever the team settles on.
-    """
+    """Persist the combined report to Azure Table Storage."""
     logging.info(
         f"[store_results] Storing report for document_id={report['document_id']}"
     )
@@ -348,20 +481,18 @@ def store_results(report: dict) -> dict:
             os.environ.get("AzureWebJobsStorage", "UseDevelopmentStorage=true"),
         )
         table_service = TableServiceClient.from_connection_string(conn_str)
-        table_client = table_service.create_table_if_not_exists(TABLE_NAME)
+        table_client  = table_service.create_table_if_not_exists(TABLE_NAME)
 
         entity = {
             "PartitionKey": "pdf-reports",
-            "RowKey": report["document_id"],
-            "blob_name": report["blob_name"],
-            "uploaded_at": report["uploaded_at"],
+            "RowKey":       report["document_id"],
+            "blob_name":    report["blob_name"],
+            "uploaded_at":  report["uploaded_at"],
             "processed_at": report["processed_at"],
-            # Table Storage doesn't support nested objects, so complex
-            # fields are serialized to JSON strings.
             "text_extraction": json.dumps(report["text_extraction"]),
-            "metadata": json.dumps(report["metadata"]),
-            "statistics": json.dumps(report["statistics"]),
-            "sensitive_data": json.dumps(report["sensitive_data"]),
+            "metadata":        json.dumps(report["metadata"]),
+            "statistics":      json.dumps(report["statistics"]),
+            "sensitive_data":  json.dumps(report["sensitive_data"]),
         }
 
         table_client.upsert_entity(entity)
@@ -404,23 +535,21 @@ def get_results(req: func.HttpRequest) -> func.HttpResponse:
             os.environ.get("AzureWebJobsStorage", "UseDevelopmentStorage=true"),
         )
         table_service = TableServiceClient.from_connection_string(conn_str)
-        table_client = table_service.get_table_client(TABLE_NAME)
+        table_client  = table_service.get_table_client(TABLE_NAME)
 
         entity = table_client.get_entity(
             partition_key="pdf-reports", row_key=document_id
         )
 
-        # Deserialize the JSON-string fields back into objects for the
-        # HTTP response.
         result = {
             "document_id": entity["RowKey"],
-            "blob_name": entity.get("blob_name"),
+            "blob_name":   entity.get("blob_name"),
             "uploaded_at": entity.get("uploaded_at"),
             "processed_at": entity.get("processed_at"),
             "text_extraction": json.loads(entity.get("text_extraction", "{}")),
-            "metadata": json.loads(entity.get("metadata", "{}")),
-            "statistics": json.loads(entity.get("statistics", "{}")),
-            "sensitive_data": json.loads(entity.get("sensitive_data", "{}")),
+            "metadata":        json.loads(entity.get("metadata", "{}")),
+            "statistics":      json.loads(entity.get("statistics", "{}")),
+            "sensitive_data":  json.loads(entity.get("sensitive_data", "{}")),
         }
 
         logging.info(f"[get_results] Found result for document_id={document_id}")

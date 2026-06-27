@@ -1,6 +1,5 @@
-azure-functions
-azure-functions-durable
-azure-data-tables
-azure-storage-blob
-PyPDF2
-pypdf
+azure-functions>=1.21.0
+azure-functions-durable>=1.2.9
+azure-data-tables>=12.5.0
+azure-storage-blob>=12.23.0
+pypdf>=4.0.0
