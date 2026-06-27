@@ -1,0 +1,6 @@
+azure-functions
+azure-functions-durable
+azure-data-tables
+azure-storage-blob
+PyPDF2
+pypdf

@@ -1,0 +1,26 @@
+# Azure Functions
+local.settings.json
+bin/
+obj/
+.python_packages/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Azurite local storage emulator files
+__azurite_db*__.json
+__blobstorage__/
+__queuestorage__/
+__tablestorage__/
+azurite-data/
+
+# Test files
+test.pdf
+
+# OS / editor
+.DS_Store
+.vscode/
+*.code-workspace

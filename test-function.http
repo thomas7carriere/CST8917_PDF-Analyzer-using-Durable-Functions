@@ -1,0 +1,23 @@
+### CST8917 - Smart PDF Analyzer
+### REST Client test file (VS Code "REST Client" extension)
+### Use the local or deployed base URL depending on what you're testing.
+
+@localBaseUrl = http://localhost:7071/api
+@azureBaseUrl = https://<YOUR-FUNCTION-APP-NAME>.azurewebsites.net/api
+
+### Replace with a real document_id returned in your Azure Functions Core
+### Tools terminal logs after uploading a PDF (see blob_trigger / orchestrator
+### log lines: "Started orchestration instance_id=... for document_id=...")
+@documentId = REPLACE-WITH-REAL-DOCUMENT-ID
+
+### 1. Get results - LOCAL (Azurite)
+GET {{localBaseUrl}}/results/{{documentId}}
+Accept: application/json
+
+### 2. Get results - AZURE (deployed)
+GET {{azureBaseUrl}}/results/{{documentId}}
+Accept: application/json
+
+### 3. Get results for a document_id that does not exist (should return 404)
+GET {{localBaseUrl}}/results/00000000-0000-0000-0000-000000000000
+Accept: application/json

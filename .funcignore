@@ -1,0 +1,10 @@
+.venv/
+azurite-data/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+local.settings.json
+test-function.http
+README.md
+.vscode/
