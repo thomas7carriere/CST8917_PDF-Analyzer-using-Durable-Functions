@@ -3,12 +3,12 @@
 ### Use the local or deployed base URL depending on what you're testing.
 
 @localBaseUrl = http://localhost:7071/api
-@azureBaseUrl = https://<YOUR-FUNCTION-APP-NAME>.azurewebsites.net/api
+@azureBaseUrl = https://pdf-analyzer-vijay.azurewebsites.net/api
 
 ### Replace with a real document_id returned in your Azure Functions Core
 ### Tools terminal logs after uploading a PDF (see blob_trigger / orchestrator
 ### log lines: "Started orchestration instance_id=... for document_id=...")
-@documentId = REPLACE-WITH-REAL-DOCUMENT-ID
+@documentId = 80b7a218-2c0d-41d4-b9a4-2dc9fa126610
 
 ### 1. Get results - LOCAL (Azurite)
 GET {{localBaseUrl}}/results/{{documentId}}
